@@ -64,6 +64,16 @@ def compute_f1(tp: int, fp: int, fn: int, am: int = 0) -> float:
     return f1_score
 
 
+def _layer_world_coordinates(layer: Points) -> np.ndarray:
+    """Return the layer points in world coordinates.
+
+    Matching must be performed in world space so that the resulting points
+    layer can be added to the viewer without carrying over per-layer
+    transforms.
+    """
+    return np.asarray([layer.data_to_world(point) for point in layer.data])
+
+
 def create_points_layer_from_pairs(
     annotations: np.ndarray,
     detections: np.ndarray,
@@ -304,8 +314,10 @@ def compute_score() -> Container:
             score_label.value = 'F1 score: -'
             return None
 
-        coordinates_annotations = annotation_layer.data
-        coordinates_detections = detection_layer.data
+        # Match in world coordinates so the resulting layer does not need to
+        # inherit the transforms of the input layers.
+        coordinates_annotations = _layer_world_coordinates(annotation_layer)
+        coordinates_detections = _layer_world_coordinates(detection_layer)
 
         if (
             len(coordinates_annotations) == 0
@@ -368,6 +380,7 @@ def compute_score() -> Container:
         )
 
         points.name = name
+
         viewer.add_layer(points)
         return points
 
