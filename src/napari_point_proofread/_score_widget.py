@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 from enum import Enum
+from typing import TypeAlias
 
 import numpy as np
 from magicgui import magic_factory
@@ -8,277 +10,413 @@ from napari.layers import Points
 from qtpy.QtWidgets import QMessageBox
 from scipy.spatial.distance import cdist
 
+Array: TypeAlias = np.ndarray
+MatchPair: TypeAlias = tuple[int, int, float]
+
 
 class MatchType(Enum):
     TRUE_POSITIVE = ('TP', 'green')
     FALSE_POSITIVE = ('FP', 'red')
     FALSE_NEGATIVE = ('FN', 'blue')
     AMBIGUOUS = ('ambiguous', 'yellow')
+    CLASS_MISMATCH = ('class mismatch', 'orange')
 
     def __init__(self, abbreviation: str, color: str):
         self.abbreviation = abbreviation
         self.color = color
 
 
+@dataclass(frozen=True)
+class MatchCounts:
+    tp: int = 0
+    fp: int = 0
+    fn: int = 0
+    ambiguous: int = 0
+
+    def fbeta(self, beta: float = 1.0) -> float:
+        return compute_fbeta(
+            self.tp, self.fp, self.fn, beta=beta, am=self.ambiguous
+        )
+
+    @property
+    def f1(self) -> float:
+        return self.fbeta()
+
+
+@dataclass
+class MatchingResult:
+    counts: MatchCounts
+    pairs: list[MatchPair]
+    ambiguous: list[int]
+
+
 _AMBIGUOUS_TOOLTIP_TEXT = (
-    'Ambiguous matches are detections that could be matched to more than one annotation.\n'
-    'This can happen when multiple annotations are within the distance threshold of a detection.\n'
-    'In this case, the detection is considered ambiguous and is not counted as a true positive.'
+    'Ambiguous matches are detections that could be matched to more than '
+    'one annotation.\n'
+    'This can happen when multiple annotations are within the distance '
+    'threshold of a detection.\n'
+    'In this case, the detection is considered ambiguous and is not '
+    'counted as a true positive.'
 )
 
 _TOOLTIP_TEXT = (
     'F1 score: harmonic mean of precision and recall\n'
-    'TP: True Positives are detections that match an annotation within the distance threshold.\n'
+    'TP: True Positives are detections that match an annotation within '
+    'the distance threshold.\n'
     'FP: False Positives are detections that do not match any annotation.\n'
     'FN: False Negatives are annotations that do not match any detection.\n'
+    'Class-aware F1: per-class counting metric computed by matching '
+    'detections and annotations of the same class only.\n'
+    'Class mismatch (orange): a detection that matches an annotation '
+    'location-wise but has a different class. It counts as a TP for the '
+    'class-agnostic F1 but as a FP/FN pair for the class-aware F1.\n'
     f'Ambiguous: {_AMBIGUOUS_TOOLTIP_TEXT}'
 )
 
 
-def compute_f1(tp: int, fp: int, fn: int, am: int = 0) -> float:
-    """Compute the F1 score.
+def compute_fbeta(
+    tp: int,
+    fp: int,
+    fn: int,
+    beta: float = 1.0,
+    am: int = 0,
+) -> float:
+    """Compute the F-beta score, penalizing ambiguous matches.
+
+    ``beta=0`` is allowed and reduces to precision.
+    """
+    if beta < 0:
+        raise ValueError('beta must be non-negative.')
+
+    if tp == fp == fn == am == 0:
+        return 0.0
+
+    beta2 = beta**2
+    numerator = (1 + beta2) * tp
+    denominator = numerator + beta2 * fn + fp + 0.5 * (1 + beta2) * am
+
+    return numerator / denominator
+
+
+def greedy_matching(
+    annotations: Array,
+    detections: Array,
+    threshold: float,
+    detection_probabilities: Array | None = None,
+    return_ambiguous: bool = False,
+) -> tuple:
+    """Match detections to annotations using greedy distance matching.
+
+    Matching is performed by selecting the closest available pair.
+    When distances tie, detections with higher probabilities are preferred.
 
     Parameters
     ----------
-    tp : int
-        The number of true positives.
-    fp : int
-        The number of false positives.
-    fn : int
-        The number of false negatives.
-    am : int, optional
-        The number of ambiguous pairs, by default 0
+    annotations : ndarray
+        Annotation coordinates with shape (n, d).
+    detections : ndarray
+        Detection coordinates with shape (m, d).
+    threshold : float
+        Maximum matching distance.
+    detection_probabilities : ndarray, optional
+        Detection probabilities used to break distance ties.
+    return_ambiguous : bool
+        Whether to return ambiguous detection indices.
 
     Returns
     -------
-    float
-        The F1 score.
+    tuple
+        TP, FP, FN, matched pairs, and optionally ambiguous detection indices.
     """
+    annotations = np.asarray(annotations)
+    detections = np.asarray(detections)
 
-    # Avoid division by zero
-    if tp == 0 and fp == 0 and fn == 0:
-        return 0.0
+    n_annotations = len(annotations)
+    n_detections = len(detections)
 
-    f1_score = (tp) / (tp + 0.5 * (fn + fp + am))
+    if detection_probabilities is not None:
+        detection_probabilities = np.asarray(detection_probabilities)
 
-    return f1_score
+        if len(detection_probabilities) != n_detections:
+            raise ValueError(
+                'detection_probabilities must have the same length '
+                'as detections.'
+            )
+
+    if n_annotations == 0 or n_detections == 0:
+        result = (
+            0,
+            n_detections,
+            n_annotations,
+            [],
+        )
+        return (*result, []) if return_ambiguous else result
+
+    distances = cdist(detections, annotations)
+
+    # Sort candidate pairs by distance, then by descending probability.
+    det_indices, ann_indices = np.indices(distances.shape)
+    candidates = np.column_stack(
+        (
+            distances.ravel(),
+            det_indices.ravel(),
+            ann_indices.ravel(),
+        )
+    )
+
+    if detection_probabilities is not None:
+        probabilities = detection_probabilities[candidates[:, 1].astype(int)]
+        order = np.lexsort((-probabilities, candidates[:, 0]))
+    else:
+        order = np.argsort(candidates[:, 0], kind='stable')
+
+    matched_detections = set()
+    matched_annotations = set()
+    pairs = []
+
+    for candidate in candidates[order]:
+        distance, det_idx, ann_idx = candidate
+        det_idx, ann_idx = int(det_idx), int(ann_idx)
+
+        if distance > threshold:
+            break
+
+        if det_idx in matched_detections or ann_idx in matched_annotations:
+            continue
+
+        pairs.append((det_idx, ann_idx, float(distance)))
+        matched_detections.add(det_idx)
+        matched_annotations.add(ann_idx)
+
+    ambiguous = []
+
+    if return_ambiguous:
+        ambiguous = [
+            det_idx
+            for det_idx, _, _ in pairs
+            if np.count_nonzero(distances[det_idx] < threshold) > 1
+        ]
+
+    tp = len(pairs)
+    fp = n_detections - tp
+    fn = n_annotations - tp
+
+    result = (tp, fp, fn, pairs)
+    return (*result, ambiguous) if return_ambiguous else result
 
 
-def _layer_world_coordinates(layer: Points) -> np.ndarray:
-    """Return the layer points in world coordinates.
+def compute_class_aware_scores(
+    annotations: Array,
+    detections: Array,
+    annotation_classes: Array,
+    detection_classes: Array,
+    threshold: float,
+    detection_probabilities: Array | None = None,
+    beta: float = 1.0,
+) -> dict:
+    """Compute class-agnostic and per-class detection scores."""
+    annotation_classes = np.asarray(annotation_classes)
+    detection_classes = np.asarray(detection_classes)
 
-    Matching must be performed in world space so that the resulting points
-    layer can be added to the viewer without carrying over per-layer
-    transforms.
-    """
+    if len(annotation_classes) != len(annotations):
+        raise ValueError(
+            'annotation_classes must have the same length as annotations.'
+        )
+
+    if len(detection_classes) != len(detections):
+        raise ValueError(
+            'detection_classes must have the same length as detections.'
+        )
+
+    # Class-agnostic matching.
+    tp, fp, fn, pairs = greedy_matching(
+        annotations,
+        detections,
+        threshold,
+        detection_probabilities,
+    )
+
+    class_mismatch = sum(
+        annotation_classes[ann_idx] != detection_classes[det_idx]
+        for det_idx, ann_idx, _ in pairs
+    )
+
+    detection_result = {
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'class_mismatch': int(class_mismatch),
+        'f': compute_fbeta(tp, fp, fn, beta),
+    }
+
+    # Same-class matching.
+    classes = np.union1d(annotation_classes, detection_classes)
+    per_class = {}
+
+    for cls in classes:
+        ann_mask = annotation_classes == cls
+        det_mask = detection_classes == cls
+
+        cls_tp, cls_fp, cls_fn, _ = greedy_matching(
+            annotations[ann_mask],
+            detections[det_mask],
+            threshold,
+            (
+                detection_probabilities[det_mask]
+                if detection_probabilities is not None
+                else None
+            ),
+        )
+
+        per_class[cls.item() if hasattr(cls, 'item') else cls] = {
+            'tp': cls_tp,
+            'fp': cls_fp,
+            'fn': cls_fn,
+            'f': compute_fbeta(cls_tp, cls_fp, cls_fn, beta),
+        }
+
+    total_tp = sum(result['tp'] for result in per_class.values())
+    total_fp = sum(result['fp'] for result in per_class.values())
+    total_fn = sum(result['fn'] for result in per_class.values())
+
+    micro = compute_fbeta(total_tp, total_fp, total_fn, beta)
+
+    macro = (
+        float(np.mean([result['f'] for result in per_class.values()]))
+        if per_class
+        else 0.0
+    )
+
+    return {
+        'detection': detection_result,
+        'per_class': per_class,
+        'micro': {
+            'tp': total_tp,
+            'fp': total_fp,
+            'fn': total_fn,
+            'f': micro,
+        },
+        'macro': macro,
+    }
+
+
+def _layer_world_coordinates(layer: Points) -> Array:
+    """Return points in world coordinates."""
     return np.asarray([layer.data_to_world(point) for point in layer.data])
 
 
 def create_points_layer_from_pairs(
-    annotations: np.ndarray,
-    detections: np.ndarray,
-    pairs: list[tuple[int, int, float]],
-    ambiguous: list[int] = None,
+    annotations: Array,
+    detections: Array,
+    pairs: list[MatchPair],
+    ambiguous: list[int] | None = None,
+    annotation_classes: Array | None = None,
+    detection_classes: Array | None = None,
 ) -> Points:
-    """Create a points layer from the matched pairs.
+    """Create a napari Points layer visualizing matching results."""
+    ambiguous = set(ambiguous or [])
 
-    Parameters
-    ----------
-    annotations : array_like
-        (n*d) with n the number of annotations and d the dimensionality of the
-        annotations
-    detections : array_like
-        (m*d) with m the number of detections and d the dimensionality of the
-        detections
-    pairs : list of tuples
-        The list of distance pairs. Each tuple contains the indices of the
-        detection and the annotation, and the distance between them.
-    ambiguous : list of int
-        The indices of the ambiguous matches in detections. An ambiguous match
-        is a detection that could be matched to more than one annotation.
+    has_classes = (
+        annotation_classes is not None and detection_classes is not None
+    )
 
-    Returns
-    -------
-    Points
-        The points layer.
-    """
+    if has_classes:
+        annotation_classes = np.asarray(annotation_classes, dtype=int)
+        detection_classes = np.asarray(detection_classes, dtype=int)
+    else:
+        annotation_classes = np.full(len(annotations), -1, dtype=int)
+        detection_classes = np.full(len(detections), -1, dtype=int)
 
-    if ambiguous is None:
-        ambiguous = []
-
-    pairs = [(int(p[0]), int(p[1]), float(p[2])) for p in pairs]
-
-    matched_det_idx = {p[0] for p in pairs}
-    matched_ann_idx = {p[1] for p in pairs}
+    matched_det = {det_idx for det_idx, _, _ in pairs}
+    matched_ann = {ann_idx for _, ann_idx, _ in pairs}
 
     coords = []
     types = []
     distances = []
-    face_colors = []  # represent the type of match: TP, FP, FN
-    border_color = []  # represent ambiguous matches
+    face_colors = []
+    border_colors = []
+    class_matches = []
+    ann_classes = []
+    det_classes = []
 
-    # Matched (use detection coordinates)
-    for det_idx, _, dist in pairs:
-        coords.append(detections[det_idx])
-        types.append(MatchType.TRUE_POSITIVE.abbreviation)
-        distances.append(dist)
-        face_colors.append(MatchType.TRUE_POSITIVE.color)
+    def append_point(
+        coordinate,
+        match_type: MatchType,
+        distance: float = np.nan,
+        ann_class: int = -1,
+        det_class: int = -1,
+        is_ambiguous: bool = False,
+    ):
+        coords.append(coordinate)
+        types.append(match_type.abbreviation)
+        distances.append(distance)
+        face_colors.append(match_type.color)
+        border_colors.append(
+            MatchType.AMBIGUOUS.color if is_ambiguous else 'transparent'
+        )
+        class_matches.append(match_type == MatchType.TRUE_POSITIVE)
+        ann_classes.append(ann_class)
+        det_classes.append(det_class)
 
-    # False positives
-    for i in range(len(detections)):
-        if i not in matched_det_idx:
-            coords.append(detections[i])
-            types.append(MatchType.FALSE_POSITIVE.abbreviation)
-            distances.append(np.nan)
-            face_colors.append(MatchType.FALSE_POSITIVE.color)
+    for det_idx, ann_idx, distance in pairs:
+        ann_class = int(annotation_classes[ann_idx])
+        det_class = int(detection_classes[det_idx])
 
-    # False negatives
-    for i in range(len(annotations)):
-        if i not in matched_ann_idx:
-            coords.append(annotations[i])
-            types.append(MatchType.FALSE_NEGATIVE.abbreviation)
-            distances.append(np.nan)
-            face_colors.append(MatchType.FALSE_NEGATIVE.color)
+        mismatch = has_classes and ann_class != det_class
+        match_type = (
+            MatchType.CLASS_MISMATCH if mismatch else MatchType.TRUE_POSITIVE
+        )
 
-    ambiguous_ = [i in ambiguous for i in range(len(coords))]
-    for i in range(len(coords)):
-        if ambiguous_[i]:
-            border_color.append(MatchType.AMBIGUOUS.color)
-        else:
-            border_color.append('transparent')
+        append_point(
+            detections[det_idx],
+            match_type,
+            distance,
+            ann_class,
+            det_class,
+            det_idx in ambiguous,
+        )
+
+    for det_idx, coordinate in enumerate(detections):
+        if det_idx not in matched_det:
+            append_point(
+                coordinate,
+                MatchType.FALSE_POSITIVE,
+                det_class=int(detection_classes[det_idx]),
+                is_ambiguous=det_idx in ambiguous,
+            )
+
+    for ann_idx, coordinate in enumerate(annotations):
+        if ann_idx not in matched_ann:
+            append_point(
+                coordinate,
+                MatchType.FALSE_NEGATIVE,
+                ann_class=int(annotation_classes[ann_idx]),
+            )
 
     return Points(
-        np.array(coords),
+        np.asarray(coords),
         name='Greedy matching',
         ndim=annotations.shape[1],
         properties={
             'type': types,
             'distance': distances,
-            'ambiguous': ambiguous_,
+            'ambiguous': [border != 'transparent' for border in border_colors],
+            'class_match': class_matches,
+            'annotation_class': ann_classes,
+            'detection_class': det_classes,
         },
         face_color=face_colors,
-        border_color=border_color,
+        border_color=border_colors,
         size=5,
     )
 
 
-def greedy_matching(
-    annotations: np.ndarray,
-    detections: np.ndarray,
-    threshold: float,
-    detection_probabilities: np.ndarray | None = None,
-    return_ambiguous: bool = False,
-) -> tuple[int, int, int, list[tuple[int, int, float]]]:
-    """Apply greedy matching to the annotations and detections.
-    Note there is no False negative detection.
-
-    Parameters
-    ----------
-    annotations : array_like
-        (n*d) with n the number of annotations and d the dimensionality of the
-        annotations
-    detections : array_like
-        (m*d) with m the number of detections and d the dimensionality of the
-        detections
-    threshold : float
-        The maximum distance between an annotation and a detection for them to
-        be considered a possible match.
-    detection_probabilities : np.ndarray, optional
-        Per-detection probability scores. When multiple candidate pairs share
-        the same minimum distance, the detection with the highest probability
-        is selected first.
-    return_ambiguous : bool
-        Whether to return the number of ambiguous matches.
-
-    Returns
-    -------
-    n_true_positives : int
-        The number of true positives.
-    n_false_positives : int
-        The number of false positives.
-    n_false_negatives : int
-        The number of false negatives.
-    distance_pairs : list of tuples
-        The list of distance pairs. Each tuple contains the indices of the
-        detection and the annotation, and the distance between them.
-    ambiguous : list of int
-        The indices of the ambiguous matches in detections. An ambiguous match
-        is a detection that could be matched to more than one annotation. This is only returned if return_ambiguous is True. This is only returned if return_ambiguous is True.
-    """
-
-    # using cdist instead of distance_matrix to avoid a bug in scipy 1.10.1
-    distance_matrix_ = cdist(detections, annotations)
-
-    if detection_probabilities is not None and len(
-        detection_probabilities
-    ) != len(detections):
-        raise ValueError(
-            'detection_probabilities must have the same length as detections.'
-        )
-
-    distance_matrix_copy = distance_matrix_.copy()
-    pairs = []
-
-    while True:
-        min_distance = np.min(distance_matrix_copy)
-
-        if min_distance > threshold:  # No more matches
-            break
-
-        candidates = np.argwhere(
-            np.isclose(distance_matrix_copy, min_distance)
-        )
-
-        if detection_probabilities is not None and len(candidates) > 1:
-            candidate_probabilities = detection_probabilities[candidates[:, 0]]
-            max_probability = np.max(candidate_probabilities)
-            candidates = candidates[
-                np.isclose(candidate_probabilities, max_probability)
-            ]
-
-        min_idx = tuple(candidates[0])
-
-        pairs.append(
-            (int(min_idx[0]), int(min_idx[1]), distance_matrix_copy[min_idx])
-        )
-
-        # Set distances to infinity for the selected row and column
-        distance_matrix_copy[min_idx[0], :] = np.inf
-        distance_matrix_copy[:, min_idx[1]] = np.inf
-
-    pairs = np.array(pairs)
-    true_positives = len(pairs)
-    false_positives = int(distance_matrix_.shape[0] - len(pairs))
-    false_negatives = int(distance_matrix_.shape[1] - len(pairs))
-
-    if return_ambiguous:
-        ambiguous = []
-
-        if true_positives != 0:
-            for i in range(distance_matrix_.shape[0]):
-                if i not in pairs[:, 0]:
-                    continue
-
-                matches = np.sum(distance_matrix_[i, :] < threshold)
-
-                if matches > 1:
-                    ambiguous.append(i)
-
-        return (
-            true_positives,
-            false_positives,
-            false_negatives,
-            pairs,
-            ambiguous,
-        )
-
-    return true_positives, false_positives, false_negatives, pairs
-
-
 def compute_score() -> Container:
-    """Build the score widget with a visible F1 result label."""
+    """Build the napari score widget."""
+
     score_label = Label(value='F1 score: -')
     score_label.label = ''
+    score_label.tooltip = _TOOLTIP_TEXT
 
     @magic_factory(
         greedy_threshold={
@@ -303,44 +441,37 @@ def compute_score() -> Container:
         greedy_threshold: float = 10.0,
         return_ambiguous: bool = False,
     ) -> Points | None:
-        """
-        Compute the (F1) score between the annotation and detection layers using greedy matching.
+        """Compute matching scores and display them in napari."""
 
-        The distance threshold is measured in world coordinates, so it is important to set the scale of the layers correctly.
-        Higher-probability points are prioritized in the matching process.
-        The function returns a new Points layer containing the matched pairs in green, the false positives in red, and the false negatives in blue.
-        """
         if annotation_layer is None or detection_layer is None:
             score_label.value = 'F1 score: -'
             return None
 
-        # Match in world coordinates so the resulting layer does not need to
-        # inherit the transforms of the input layers.
-        coordinates_annotations = _layer_world_coordinates(annotation_layer)
-        coordinates_detections = _layer_world_coordinates(detection_layer)
+        annotations = _layer_world_coordinates(annotation_layer)
+        detections = _layer_world_coordinates(detection_layer)
 
-        if (
-            len(coordinates_annotations) == 0
-            or len(coordinates_detections) == 0
-        ):
+        if not len(annotations) or not len(detections):
             score_label.value = 'F1 score: -'
             QMessageBox.warning(
                 None,
                 'Empty layer',
-                'One of the layers is empty. Please provide non-empty annotation and detection layers.',
+                'One of the layers is empty. Please provide non-empty '
+                'annotation and detection layers.',
             )
             return None
 
+        probabilities = (
+            detection_layer.features['probability'].to_numpy()
+            if 'probability' in detection_layer.features
+            else None
+        )
+
         result = greedy_matching(
-            annotations=coordinates_annotations,
-            detections=coordinates_detections,
-            threshold=greedy_threshold,
-            detection_probabilities=(
-                detection_layer.features['probability'].to_numpy()
-                if 'probability' in detection_layer.features
-                else None
-            ),
-            return_ambiguous=return_ambiguous,
+            annotations,
+            detections,
+            greedy_threshold,
+            probabilities,
+            return_ambiguous,
         )
 
         if return_ambiguous:
@@ -349,20 +480,67 @@ def compute_score() -> Container:
             tp, fp, fn, pairs = result
             ambiguous = []
 
-        score = compute_f1(tp, fp, fn, len(ambiguous))
+        score = compute_fbeta(tp, fp, fn, beta=1.0, am=len(ambiguous))
 
-        # each value is colored according to the type of match
+        class_text = ''
+        annotation_class_values = None
+        detection_class_values = None
+
+        if (
+            'class' in annotation_layer.features
+            and 'class' in detection_layer.features
+        ):
+            annotation_class_values = (
+                annotation_layer.features['class'].to_numpy().astype(int)
+            )
+            detection_class_values = (
+                detection_layer.features['class'].to_numpy().astype(int)
+            )
+
+            if len(annotation_class_values) == len(annotations) and len(
+                detection_class_values
+            ) == len(detections):
+                class_scores = compute_class_aware_scores(
+                    annotations,
+                    detections,
+                    annotation_class_values,
+                    detection_class_values,
+                    greedy_threshold,
+                    probabilities,
+                )
+
+                mismatch = class_scores['detection']['class_mismatch']
+
+                per_class = ', '.join(
+                    f'class {cls}: {counts["f"]:.3f}'
+                    for cls, counts in class_scores['per_class'].items()
+                )
+
+                class_text = (
+                    f'<br>Class-aware F1: '
+                    f'{class_scores["micro"]["f"]:.3f} '
+                    f'(macro: {class_scores["macro"]:.3f}) '
+                    f'[{per_class}]'
+                    f'<br>Class mismatch: '
+                    f'<span style="color: '
+                    f'{MatchType.CLASS_MISMATCH.color};">'
+                    f'{mismatch}</span>'
+                )
+
         score_label.value = (
-            f'F1 score: {score:.3f}'
-            f'TP: <span style="color: {MatchType.TRUE_POSITIVE.color};">{tp}</span>, '
-            f'FP: <span style="color: {MatchType.FALSE_POSITIVE.color};">{fp}</span>, '
-            f'FN: <span style="color: {MatchType.FALSE_NEGATIVE.color};">{fn}</span>, '
-            f'Ambiguous: <span style="color: {MatchType.AMBIGUOUS.color};">{len(ambiguous)}</span>'
+            f'F1 score: {score:.3f}<br>'
+            f'TP: <span style="color: green;">{tp}</span>, '
+            f'FP: <span style="color: red;">{fp}</span>, '
+            f'FN: <span style="color: blue;">{fn}</span>, '
+            f'Ambiguous: <span style="color: yellow;">'
+            f'{len(ambiguous)}</span>'
+            f'{class_text}'
         )
-        name = f'Greedy matching (annot: {annotation_layer.name}, det: {detection_layer.name})'
 
-        # add a tooltip on score_label to explain what the numbers mean
-        score_label.tooltip = _TOOLTIP_TEXT
+        name = (
+            f'Greedy matching (annot: {annotation_layer.name}, '
+            f'det: {detection_layer.name})'
+        )
 
         existing = next(
             (layer for layer in viewer.layers if layer.name == name),
@@ -373,19 +551,20 @@ def compute_score() -> Container:
             viewer.layers.remove(existing)
 
         points = create_points_layer_from_pairs(
-            annotations=coordinates_annotations,
-            detections=coordinates_detections,
-            pairs=pairs,
-            ambiguous=ambiguous,
+            annotations,
+            detections,
+            pairs,
+            ambiguous,
+            annotation_class_values,
+            detection_class_values,
         )
 
         points.name = name
-
         viewer.add_layer(points)
+
         return points
 
-    score_widget = _compute_score()
     return Container(
-        widgets=[score_widget, score_label],
+        widgets=[_compute_score(), score_label],
         labels=False,
     )
