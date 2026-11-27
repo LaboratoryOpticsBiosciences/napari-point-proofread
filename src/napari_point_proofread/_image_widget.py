@@ -30,56 +30,83 @@ from qtpy.QtCore import Qt
 from ._widget_utils import _make_titled_panel, _show_help_dialog, setup_layout
 
 
+def find_RGB_channel_axis(data: np.ndarray) -> int:
+    """
+    Find the channel axis in a multi-dimensional image array.
+    If no axis has size 3, indicating that the image cannot be interpreted as RGB.
+    """
+    for i, size in enumerate(data.shape):
+        if size == 3:
+            return i
+    raise ValueError('No axis has size 3, cannot convert to RGB')
+
+
+def cvtRGB(
+    img_layer: L.Image,
+    channel_axis: int = None,
+) -> types.LayerDataTuple:
+    if img_layer is None:
+        return None
+
+    data = img_layer.data
+
+    if data.ndim < 3:
+        raise ValueError(
+            f'Image must have at least 3 dimensions, got {data.ndim}'
+        )
+
+    if channel_axis is None:
+        channel_axis = find_RGB_channel_axis(data)
+
+    if channel_axis < 0 or channel_axis >= data.ndim:
+        raise ValueError(
+            f'Channel axis must be between 0 and {data.ndim - 1}, got {channel_axis}'
+        )
+
+    new_data = np.moveaxis(data, channel_axis, -1)
+
+    return (
+        new_data,
+        {'name': f'{img_layer.name}_RGB', 'colormap': 'gray'},
+    )
+
+
 @magic_factory(
     img_layer={'tooltip': 'Select raw image'},
+    channel_axis={'tooltip': 'Index of the channel axis to move to the end'},
     call_button='Convert to RGB',
 )
 def widget_cvtRGB(
     viewer: 'napari.Viewer',
     img_layer: L.Image,
+    channel_axis: int = None,
 ) -> types.LayerDataTuple:
-    """Move a channel axis to the end so napari can display the image as RGB.
+    """Convert a multi-dimensional image to RGB by moving the channel axis to the end.
 
     Parameters
     ----------
     viewer : napari.Viewer
-        Active Napari viewer that owns the layers.
+        Active Napari viewer.
     img_layer : napari.layers.Image
-        The selected image layer to convert.
+        The image layer to convert.
+    channel_axis : int, optional
+        The index of the channel axis to move to the end. If None, automatically find the axis with size 3.
 
     Returns
     -------
-    LayerDataTuple or None
-        RGB image layer data when conversion is possible, otherwise ``None``.
+    tuple
+        A tuple containing the new image data and metadata for the new layer.
     """
-    # print(len(viewer.layers))
-    # print(f"you have selected {img_layer}")
-
-    # Do nothing if no image layers are present.
-    # This prevents errors when the widget is initialized.
-    if len(viewer.layers) < 1:
+    if img_layer is None:
         return None
 
-    data = img_layer.data
-    # print(data.shape, data.ndim, data.dtype)
-    if data.ndim == 4:
-        # assume (z, c=3, y, x) or (c=3, z, y, x)
-        if data.shape[-1] == 3:
-            return None
-        elif data.shape[1] == 3:
-            # (z, c=3, y, x)
-            # data = img_layer.data.transpose(1, 0, 2, 3)
-            viewer.layers.pop(viewer.layers.index(img_layer))
-            kwargs = {'name': img_layer.name + '_rgb'}
-            return (data.transpose(0, 2, 3, 1), kwargs, 'image')
-        elif data.shape[0] == 3:
-            # (c=3, z, y, x)
-            # data = img_layer.data.transpose(1, 0, 2, 3)
-            viewer.layers.pop(viewer.layers.index(img_layer))
-            kwargs = {'name': img_layer.name + '_rgb'}
-            return (data.transpose(1, 2, 3, 0), kwargs, 'image')
-    else:
-        return None
+    # pop the previous img layer from the viewer if it exists
+    for layer in viewer.layers:
+        if layer.name == f'{img_layer.name}':
+            viewer.layers.remove(layer)
+            break
+
+    return cvtRGB(img_layer=img_layer, channel_axis=channel_axis)
 
 
 @thread_worker
@@ -96,6 +123,9 @@ def normalize(
     else:
         vmax = np.percentile(data, perc)
 
+    # if dask array, compute() is needed to get the actual value
+    if hasattr(vmax, 'compute'):
+        vmax = vmax.compute()
     return vmax
 
 
@@ -186,7 +216,7 @@ def widget_contrast_limits_all(
         'widget_type': 'FloatSlider',
         'value': 1.0,
         'step': 0.1,
-        'min': 0.5,
+        'min': 0.0001,
         'max': 5.0,
         'tooltip': 'Adjust z scale for all image layers',
     },
@@ -195,7 +225,7 @@ def widget_contrast_limits_all(
         'widget_type': 'FloatSlider',
         'value': 1.0,
         'step': 0.1,
-        'min': 0.5,
+        'min': 0.0001,
         'max': 5.0,
         'tooltip': 'Adjust y scale for all image layers',
     },
@@ -204,7 +234,7 @@ def widget_contrast_limits_all(
         'widget_type': 'FloatSlider',
         'value': 1.0,
         'step': 0.1,
-        'min': 0.5,
+        'min': 0.0001,
         'max': 5.0,
         'tooltip': 'Adjust x scale for all image layers',
     },
@@ -351,6 +381,7 @@ class MainWidget(Container):
         cvt_widget = widget_cvtRGB()
         cvt_widget.call_button.text = 'Convert to RGB'
         cvt_widget.call_button.tooltip = 'Convert the selected image to RGB by moving the channel axis to the end'
+        cvt_widget.channel_axis.tooltip = 'Axis index of the channel dimension to move to the end. If None, automatically find the axis with size 3.'
 
         norm_widget = widget_norm
         norm_widget.call_button.text = 'Normalize (perc=99)'
@@ -448,6 +479,20 @@ class MainWidget(Container):
 
         cvt_widget.img_layer.changed.connect(_sync_shared_img_layer)
         _sync_shared_img_layer()
+
+        # connect channel axis to change in the image layer selection
+        # to show the shape of the selected image layer
+        def _update_channel_axis_range(_event=None):
+            selected_layer = cvt_widget.img_layer.value
+            if selected_layer is not None:
+                data = selected_layer.data
+                cvt_widget.channel_axis.max = data.ndim - 1
+                cvt_widget.channel_axis.min = 0
+                cvt_widget.channel_axis.value = find_RGB_channel_axis(data)
+                cvt_widget.channel_axis.label = f'Channel axis ({data.shape})'
+
+        cvt_widget.img_layer.changed.connect(_update_channel_axis_range)
+        _update_channel_axis_range()
 
         help_button = PushButton(text='❓ Show help')
         help_button.label = ''
