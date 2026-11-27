@@ -112,20 +112,33 @@ def widget_cvtRGB(
 @thread_worker
 def normalize(
     img_layer: L.Image,
+    channel_axis: int = None,
     perc: float = 99.0,
 ):
-    """Calculate the 99th percentile in a background thread."""
+    """Calculate the percentile per channel in a background thread."""
     data = img_layer.data
 
-    if data.shape[-1] == 3:
-        _vmax = np.percentile(data, perc, axis=tuple(range(data.ndim - 1)))
-        vmax = max(_vmax)
+    if channel_axis is not None:
+        if channel_axis < 0 or channel_axis >= data.ndim:
+            raise ValueError(
+                f'Channel axis must be between 0 and {data.ndim - 1}, got {channel_axis}'
+            )
+
+        _vmax = np.percentile(
+            data,
+            perc,
+            axis=tuple(i for i in range(data.ndim) if i != channel_axis),
+        )
+        vmax = np.max(
+            _vmax
+        )  # take the max across channels to get a single value
     else:
         vmax = np.percentile(data, perc)
 
-    # if dask array, compute() is needed to get the actual value
+    # If dask array, compute() is needed to get the actual values
     if hasattr(vmax, 'compute'):
         vmax = vmax.compute()
+
     return vmax
 
 
@@ -138,11 +151,12 @@ def normalize(
 def widget_norm(
     viewer: 'napari.Viewer',
     img_layer: L.Image,
+    channel_axis: int = None,
 ):
     if img_layer is None:
         return
 
-    worker = normalize(img_layer, perc=99)
+    worker = normalize(img_layer, perc=99, channel_axis=channel_axis)
 
     def update_layer(vmax):
         # Update safely on the main thread
@@ -287,11 +301,9 @@ def widget_scale(
     scale_z = round(scale_z, 1)
     scale_y = round(scale_y, 1)
     scale_x = round(scale_x, 1)
-    # print(scale_z, scale_y, scale_x)
     scale = scale_z, scale_y, scale_x
     for layer in viewer.layers:
         if hasattr(layer, 'scale'):
-            # print(f"set scale of {layer.name} to {scale}")
             layer.scale = scale
 
 
@@ -310,7 +322,6 @@ def _scale_z_default(value):
         The scale widget and matching layers are updated in place.
     """
     viewer = widget_scale.viewer.value
-    # print(viewer, type(viewer))
     scale_z = 1.0
     scale_y = widget_scale.scale_y.value
     scale_x = widget_scale.scale_x.value
@@ -345,7 +356,6 @@ def _scale_y_default(value):
     widget_scale.scale_y.value = scale_y
     for layer in viewer.layers:
         if hasattr(layer, 'scale'):
-            # print(f"set scale of {layer.name} to {scale}")
             layer.scale = scale
 
 
@@ -372,7 +382,6 @@ def _scale_x_default(value):
     widget_scale.scale_x.value = scale_x
     for layer in viewer.layers:
         if hasattr(layer, 'scale'):
-            # print(f"set scale of {layer.name} to {scale}")
             layer.scale = scale
 
 
@@ -384,7 +393,7 @@ class MainWidget(Container):
         cvt_widget.channel_axis.tooltip = 'Axis index of the channel dimension to move to the end. If None, automatically find the axis with size 3.'
 
         norm_widget = widget_norm
-        norm_widget.call_button.text = 'Normalize (perc=99)'
+        norm_widget.call_button.text = 'Normalize per channel (perc=99)'
         norm_widget.call_button.tooltip = (
             'Normalize the selected image by setting the maximum contrast limit to '
             'the 99 percentile of the image'
@@ -448,8 +457,10 @@ class MainWidget(Container):
         setup_layout(widget_contrast_limits_all)
 
         # Share one layer selector across Convert/Normalize to save space.
+        # And also share one channel axis selector across Convert/Normalize to save space.
         cvt_widget.img_layer.label = 'Image layer'
         norm_widget.img_layer.visible = False
+        norm_widget.channel_axis.visible = False
 
         def _sync_shared_img_layer(_event=None):
             selected_layer = cvt_widget.img_layer.value
@@ -491,8 +502,30 @@ class MainWidget(Container):
                 cvt_widget.channel_axis.value = find_RGB_channel_axis(data)
                 cvt_widget.channel_axis.label = f'Channel axis ({data.shape})'
 
+                # Update the hidden channel axis in the normalize widget.
+                norm_widget.channel_axis.max = data.ndim - 1
+                norm_widget.channel_axis.min = 0
+                norm_widget.channel_axis.value = find_RGB_channel_axis(data)
+                norm_widget.channel_axis.label = f'Channel axis ({data.shape})'
+
         cvt_widget.img_layer.changed.connect(_update_channel_axis_range)
         _update_channel_axis_range()
+
+        # sync the channel axis between the two widgets
+        def _sync_channel_axis(_event=None):
+            selected_layer = cvt_widget.img_layer.value
+            if selected_layer is not None:
+                data = selected_layer.data
+                channel_axis = cvt_widget.channel_axis.value
+
+                # Update the hidden channel axis in the normalize widget.
+                norm_widget.channel_axis.max = data.ndim - 1
+                norm_widget.channel_axis.min = 0
+                norm_widget.channel_axis.value = channel_axis
+                norm_widget.channel_axis.label = f'Channel axis ({data.shape})'
+
+        cvt_widget.channel_axis.changed.connect(_sync_channel_axis)
+        _sync_channel_axis()
 
         help_button = PushButton(text='❓ Show help')
         help_button.label = ''
